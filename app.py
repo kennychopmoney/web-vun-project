@@ -27,15 +27,21 @@ def api_scan():
         return jsonify({"error": "The URL must be a string."}), 400
     target = (target_value or "").strip()
     active = payload.get("active") is True
+    reconnaissance = payload.get("reconnaissance") is True
     authorized = payload.get("authorized") is True
 
     if not target:
         return jsonify({"error": "A URL is required."}), 400
-    if active and not authorized:
-        return jsonify({"error": "Confirm that you have explicit authorization before enabling active checks."}), 403
+    if (active or reconnaissance) and not authorized:
+        return jsonify({"error": "Confirm explicit authorization before enabling active checks."}), 403
 
     try:
-        result = scan_url(target, active=active, allowed_hosts=ACTIVE_ALLOWED_HOSTS)
+        result = scan_url(
+            target,
+            active=active,
+            allowed_hosts=ACTIVE_ALLOWED_HOSTS,
+            reconnaissance=reconnaissance,
+        )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:  # pragma: no cover - defensive handling for runtime issues

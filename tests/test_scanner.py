@@ -3,7 +3,14 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 from app import app
-from scanner import _NoRedirectHandler, analyze_headers, analyze_html, check_reflected_input
+from scanner import (
+    RECON_PORTS,
+    _NoRedirectHandler,
+    analyze_headers,
+    analyze_html,
+    check_reflected_input,
+    run_reconnaissance,
+)
 
 
 class FakeResponse:
@@ -121,6 +128,31 @@ class ScannerTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 403)
         self.assertIn("authorization", response.get_json()["error"].lower())
+
+    @patch("scanner.socket.create_connection", side_effect=ConnectionRefusedError)
+    @patch("scanner._resolve_public_addresses", return_value=["93.184.216.34"])
+    @patch(
+        "scanner.socket.getaddrinfo",
+        return_value=[(None, None, None, None, ("93.184.216.34", 443))],
+    )
+    def test_recon_checks_only_fixed_web_ports(self, _mock_dns, _mock_resolve, mock_connect):
+        results = run_reconnaissance("https://test.example.com/", {"test.example.com"})
+
+        self.assertEqual([item["port"] for item in results["port_results"]], list(RECON_PORTS))
+        self.assertEqual(mock_connect.call_count, len(RECON_PORTS))
+        self.assertTrue(all(item["status"] == "closed_or_filtered" for item in results["port_results"]))
+        self.assertFalse(results["http"]["redirects_followed"])
+        self.assertIsNone(results["tls"])
+
+    @patch("scanner.scan_url")
+    def test_api_requires_authorization_for_reconnaissance(self, mock_scan):
+        with app.test_client() as client:
+            response = client.post(
+                "/api/scan",
+                json={"url": "https://test.example.com/", "reconnaissance": True},
+            )
+        self.assertEqual(response.status_code, 403)
+        mock_scan.assert_not_called()
 
 
 if __name__ == "__main__":

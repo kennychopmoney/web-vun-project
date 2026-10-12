@@ -15,6 +15,7 @@ A lightweight web vulnerability scanner built with Flask. It checks a target URL
 - Exports scan results as a JSON report
 - Redacts cookie values from displayed evidence
 - Uses non-intrusive checks; findings are heuristics and should be manually verified
+- Offers optional, allowlisted active reconnaissance: public DNS addresses, TLS certificate metadata, HTTP metadata, and TCP connect checks on ports 80, 443, 8080, and 8443
 - Shows a simple risk score and summary
 - Includes a lightweight browser UI
 
@@ -23,6 +24,8 @@ Only scan systems you own or have explicit permission to assess. Passive checks 
 Active checks require an exact hostname allowlist configured by the server operator, and an authorization confirmation in the UI. Set `WEBVUN_ACTIVE_ALLOWED_HOSTS` to a comma-separated list such as `test.example.com,staging.example.com`. Hosts resolving to non-public IP addresses are rejected. At most five query parameters are probed per scan, with a five-second request timeout and 1 MB response limit.
 
 For an active check, include the query parameter(s) you want assessed in the target URL, for example `https://test.example.com/search?q=sample`. The scanner appends a random alphanumeric marker to each existing value and reports if that marker appears in an HTML response.
+
+Active reconnaissance uses the same exact-host allowlist and authorization checkbox. It checks no more than four resolved addresses, only the fixed web-port list above, uses a 0.5-second connect timeout, does not follow redirects, and does not enumerate paths, authenticate, or send exploit payloads. "Closed or filtered" is reported as an ambiguous result because a TCP connect check cannot distinguish a firewall drop from a closed port.
 
 ## Run it locally
 

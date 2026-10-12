@@ -30,14 +30,18 @@
             <input id="active-check" type="checkbox" />
             Run active reflected-input checks (sends harmless markers in existing query parameters)
           </label>
+          <label class="check-option">
+            <input id="recon-check" type="checkbox" />
+            Run active reconnaissance (DNS, TLS/HTTP metadata, and fixed web-port checks)
+          </label>
           <label class="check-option authorization-option">
             <input id="authorization-confirmed" type="checkbox" />
             I confirm I have explicit authorization to actively test this host
           </label>
           <p class="active-note">
             Active checks require the server operator to allowlist the exact hostname with
-            <code>WEBVUN_ACTIVE_ALLOWED_HOSTS</code>. Checks are limited to five query parameters, do not submit forms,
-            and do not follow redirects.
+            <code>WEBVUN_ACTIVE_ALLOWED_HOSTS</code>. Reflected-input checks are limited to five query parameters.
+            Recon checks only ports 80, 443, 8080, and 8443, do not submit forms, and do not follow redirects.
           </p>
         </form>
 
@@ -66,6 +70,7 @@
           </div>
           <h2>Findings and remediation</h2>
           <button id="download-report" class="download-button" type="button" disabled>Download JSON report</button>
+          <section id="recon-results" class="recon-results hidden" aria-live="polite"></section>
           <ul id="findings-list"></ul>
         </section>
       </main>

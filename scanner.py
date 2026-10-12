@@ -2,6 +2,8 @@ import ipaddress
 import re
 import secrets
 import socket
+import ssl
+from datetime import datetime, timezone
 from typing import Dict, List
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
@@ -14,6 +16,7 @@ SEVERITY_WEIGHT = {
     "high": 20,
     "critical": 30,
 }
+RECON_PORTS = (80, 443, 8080, 8443)
 
 FINDING_GUIDANCE = {
     "Missing HSTS header": (
@@ -151,7 +154,7 @@ def _fetch_page(url: str, follow_redirects: bool = True, max_bytes: int | None =
         }
 
 
-def _validate_active_target(url: str, allowed_hosts: set[str]) -> str:
+def _validate_active_target(url: str, allowed_hosts: set[str], require_query: bool = True) -> str:
     normalized_url = _ensure_valid_url(url)
     parsed = urlparse(normalized_url)
     hostname = (parsed.hostname or "").lower().rstrip(".")
@@ -163,7 +166,7 @@ def _validate_active_target(url: str, allowed_hosts: set[str]) -> str:
             "Active checks are disabled for this host. Add its exact hostname to "
             "WEBVUN_ACTIVE_ALLOWED_HOSTS on the server."
         )
-    if not parsed.query:
+    if require_query and not parsed.query:
         raise ValueError("Add one or more query parameters to the URL to run reflected-input checks.")
 
     try:
@@ -174,6 +177,88 @@ def _validate_active_target(url: str, allowed_hosts: set[str]) -> str:
     if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise ValueError("Active checks require an allowlisted hostname that resolves only to public IP addresses.")
     return normalized_url
+
+
+def _resolve_public_addresses(hostname: str, port: int | None) -> List[str]:
+    try:
+        addresses = sorted(
+            {entry[4][0] for entry in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)}
+        )
+    except OSError as exc:
+        raise ValueError(f"Could not resolve the allowlisted host: {exc}") from exc
+
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise ValueError("Active checks require an allowlisted hostname that resolves only to public IP addresses.")
+    return addresses
+
+
+def _read_tls_certificate(hostname: str, address: str, port: int) -> Dict:
+    tls_context = ssl.create_default_context()
+    with socket.create_connection((address, port), timeout=1) as raw_socket:
+        with tls_context.wrap_socket(raw_socket, server_hostname=hostname) as tls_socket:
+            certificate = tls_socket.getpeercert()
+            expires_at = certificate.get("notAfter")
+            expiry = (
+                datetime.fromtimestamp(ssl.cert_time_to_seconds(expires_at), timezone.utc).isoformat()
+                if expires_at
+                else None
+            )
+            names = [
+                value
+                for name_type, value in certificate.get("subjectAltName", [])
+                if name_type == "DNS"
+            ][:20]
+            return {
+                "tls_version": tls_socket.version(),
+                "cipher": tls_socket.cipher()[0] if tls_socket.cipher() else None,
+                "certificate_subject_alt_names": names,
+                "certificate_expires_at": expiry,
+            }
+
+
+def run_reconnaissance(url: str, allowed_hosts: set[str]) -> Dict:
+    normalized_url = _validate_active_target(url, allowed_hosts, require_query=False)
+    parsed = urlsplit(normalized_url)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    addresses = _resolve_public_addresses(hostname, parsed.port)
+
+    port_results = []
+    for address in addresses[:4]:
+        for port in RECON_PORTS:
+            try:
+                with socket.create_connection((address, port), timeout=0.5):
+                    port_results.append({"address": address, "port": port, "status": "open"})
+            except (TimeoutError, ConnectionRefusedError, OSError):
+                port_results.append({"address": address, "port": port, "status": "closed_or_filtered"})
+
+    tls_details = None
+    tls_port = parsed.port if parsed.port in {443, 8443} else (443 if parsed.scheme == "https" else None)
+    if tls_port is not None:
+        tls_address = next(
+            (address for address in addresses if any(result["address"] == address and result["port"] == tls_port and result["status"] == "open" for result in port_results)),
+            None,
+        )
+        if tls_address:
+            try:
+                tls_details = _read_tls_certificate(hostname, tls_address, tls_port)
+            except (OSError, ssl.SSLError, ValueError) as exc:
+                tls_details = {"error": f"TLS details unavailable: {exc}"}
+
+    return {
+        "hostname": hostname,
+        "addresses": addresses,
+        "checked_ports": list(RECON_PORTS),
+        "port_results": port_results,
+        "tls": tls_details,
+        "http": {
+            "requested_url": normalized_url,
+            "redirects_followed": False,
+        },
+        "limits": {
+            "maximum_addresses_checked": 4,
+            "connect_timeout_seconds": 0.5,
+        },
+    }
 
 
 def check_reflected_input(url: str, allowed_hosts: set[str]) -> List[Dict]:
@@ -409,16 +494,22 @@ def analyze_html(html: str, target_url: str = "") -> List[Dict]:
     return findings
 
 
-def scan_url(url: str, active: bool = False, allowed_hosts: set[str] | None = None) -> Dict:
+def scan_url(
+    url: str,
+    active: bool = False,
+    allowed_hosts: set[str] | None = None,
+    reconnaissance: bool = False,
+) -> Dict:
     normalized_url = _ensure_valid_url(url)
-    if active:
+    if active or reconnaissance:
         if allowed_hosts is None:
             raise ValueError("Active checks are not configured on this server.")
-        normalized_url = _validate_active_target(normalized_url, allowed_hosts)
+        normalized_url = _validate_active_target(normalized_url, allowed_hosts, require_query=active)
+    restricted_active_scan = active or reconnaissance
     page = _fetch_page(
         normalized_url,
-        follow_redirects=not active,
-        max_bytes=1_000_000 if active else None,
+        follow_redirects=not restricted_active_scan,
+        max_bytes=1_000_000 if restricted_active_scan else None,
     )
     findings = analyze_headers(page["headers"], normalized_url)
     findings.extend(analyze_html(page["html"], normalized_url))
@@ -428,6 +519,7 @@ def scan_url(url: str, active: bool = False, allowed_hosts: set[str] | None = No
         active_findings = _check_reflected_input_validated(normalized_url)
         findings.extend(active_findings)
         active_checks["probes_sent"] = len(parse_qsl(urlparse(normalized_url).query, keep_blank_values=True))
+    recon_results = run_reconnaissance(normalized_url, allowed_hosts or set()) if reconnaissance else None
 
     summary = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
     for item in findings:
@@ -446,5 +538,6 @@ def scan_url(url: str, active: bool = False, allowed_hosts: set[str] | None = No
         "summary": summary,
         "findings": findings,
         "active_checks": active_checks,
+        "reconnaissance": recon_results,
     }
     return result

@@ -188,6 +188,24 @@ button:hover {
   margin-top: 1.5rem;
 }
 
+.recon-results {
+  margin-bottom: 1.25rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-2);
+  line-height: 1.5;
+}
+
+.recon-results h3,
+.recon-results p {
+  margin-top: 0;
+}
+
+.recon-results p:last-of-type {
+  margin-bottom: 0.5rem;
+}
+
 .meta-row {
   display: flex;
   justify-content: space-between;
