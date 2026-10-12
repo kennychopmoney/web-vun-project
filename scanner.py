@@ -1,7 +1,11 @@
+import ipaddress
 import re
+import secrets
+import socket
 from typing import Dict, List
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 SEVERITY_WEIGHT = {
     "info": 0,
@@ -117,10 +121,26 @@ def _extract_title(html: str) -> str:
     return re.sub(r"\s+", " ", match.group(1)).strip() or "Untitled page"
 
 
-def _fetch_page(url: str) -> Dict:
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def _fetch_page(url: str, follow_redirects: bool = True, max_bytes: int | None = None) -> Dict:
     request = Request(url, headers={"User-Agent": "WebVunScanner/1.0"})
-    with urlopen(request, timeout=10) as response:
-        content = response.read().decode("utf-8", errors="replace")
+    opener = build_opener() if follow_redirects else build_opener(_NoRedirectHandler)
+    try:
+        response_context = opener.open(request, timeout=10)
+    except HTTPError as exc:
+        if not follow_redirects and 300 <= exc.code < 400:
+            raise ValueError("Active scans do not follow redirects. Scan the authorized destination directly.") from exc
+        raise
+
+    with response_context as response:
+        content_bytes = response.read(max_bytes + 1) if max_bytes is not None else response.read()
+        if max_bytes is not None and len(content_bytes) > max_bytes:
+            raise ValueError(f"Response exceeded the {max_bytes // 1_000_000} MB safety limit.")
+        content = content_bytes.decode("utf-8", errors="replace")
         headers = {str(key): str(value) for key, value in response.headers.items()}
         return {
             "url": response.geturl(),
@@ -129,6 +149,86 @@ def _fetch_page(url: str) -> Dict:
             "headers": headers,
             "html": content,
         }
+
+
+def _validate_active_target(url: str, allowed_hosts: set[str]) -> str:
+    normalized_url = _ensure_valid_url(url)
+    parsed = urlparse(normalized_url)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+
+    if parsed.username or parsed.password:
+        raise ValueError("Active checks do not allow URLs containing embedded credentials.")
+    if hostname not in allowed_hosts:
+        raise ValueError(
+            "Active checks are disabled for this host. Add its exact hostname to "
+            "WEBVUN_ACTIVE_ALLOWED_HOSTS on the server."
+        )
+    if not parsed.query:
+        raise ValueError("Add one or more query parameters to the URL to run reflected-input checks.")
+
+    try:
+        addresses = {entry[4][0] for entry in socket.getaddrinfo(hostname, parsed.port, type=socket.SOCK_STREAM)}
+    except OSError as exc:
+        raise ValueError(f"Could not resolve the allowlisted host: {exc}") from exc
+
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise ValueError("Active checks require an allowlisted hostname that resolves only to public IP addresses.")
+    return normalized_url
+
+
+def check_reflected_input(url: str, allowed_hosts: set[str]) -> List[Dict]:
+    target_url = _validate_active_target(url, allowed_hosts)
+    return _check_reflected_input_validated(target_url)
+
+
+def _check_reflected_input_validated(target_url: str) -> List[Dict]:
+    parsed = urlsplit(target_url)
+    parameters = parse_qsl(parsed.query, keep_blank_values=True)
+    if len(parameters) > 5:
+        raise ValueError("Active checks are limited to five query parameters per scan.")
+
+    findings: List[Dict] = []
+    opener = build_opener(_NoRedirectHandler)
+    for index, (parameter_name, value) in enumerate(parameters):
+        marker = f"webvun{secrets.token_hex(12)}"
+        probed_parameters = list(parameters)
+        probed_parameters[index] = (parameter_name, f"{value}{marker}")
+        probe_url = urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urlencode(probed_parameters), "")
+        )
+        request = Request(
+            probe_url,
+            headers={
+                "User-Agent": "WebVunScanner/1.0 (authorized passive-impact check)",
+                "Accept": "text/html",
+            },
+        )
+        try:
+            response_context = opener.open(request, timeout=5)
+        except HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise ValueError(
+                    "Active checks do not follow redirects. Verify the destination and scan it directly."
+                ) from exc
+            raise
+
+        with response_context as response:
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read(1_000_001)
+
+        if len(body) > 1_000_000:
+            raise ValueError("Active check response exceeded the 1 MB safety limit.")
+        if "html" in content_type.lower() and marker.encode("ascii") in body:
+            _add_finding(
+                findings,
+                "low",
+                "Input marker reflected in HTML response",
+                "A harmless unique marker supplied in a query parameter appeared in the HTML response. "
+                "This does not confirm executable XSS; verify the output context and encoding manually.",
+                f"Marker from query parameter '{parameter_name}' was present in the HTML response.",
+            )
+
+    return findings
 
 
 def _add_finding(findings: List[Dict], severity: str, title: str, description: str, evidence: str = "") -> None:
@@ -309,11 +409,25 @@ def analyze_html(html: str, target_url: str = "") -> List[Dict]:
     return findings
 
 
-def scan_url(url: str) -> Dict:
+def scan_url(url: str, active: bool = False, allowed_hosts: set[str] | None = None) -> Dict:
     normalized_url = _ensure_valid_url(url)
-    page = _fetch_page(normalized_url)
+    if active:
+        if allowed_hosts is None:
+            raise ValueError("Active checks are not configured on this server.")
+        normalized_url = _validate_active_target(normalized_url, allowed_hosts)
+    page = _fetch_page(
+        normalized_url,
+        follow_redirects=not active,
+        max_bytes=1_000_000 if active else None,
+    )
     findings = analyze_headers(page["headers"], normalized_url)
     findings.extend(analyze_html(page["html"], normalized_url))
+
+    active_checks = {"enabled": active, "probes_sent": 0}
+    if active:
+        active_findings = _check_reflected_input_validated(normalized_url)
+        findings.extend(active_findings)
+        active_checks["probes_sent"] = len(parse_qsl(urlparse(normalized_url).query, keep_blank_values=True))
 
     summary = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
     for item in findings:
@@ -331,5 +445,6 @@ def scan_url(url: str) -> Dict:
         "risk_score": risk_score,
         "summary": summary,
         "findings": findings,
+        "active_checks": active_checks,
     }
     return result

@@ -5,6 +5,8 @@ const summaryBox = document.getElementById('summary');
 const resultsBox = document.getElementById('results');
 const findingsList = document.getElementById('findings-list');
 const downloadButton = document.getElementById('download-report');
+const activeCheckInput = document.getElementById('active-check');
+const authorizationInput = document.getElementById('authorization-confirmed');
 
 const severityOrder = ['critical', 'high', 'medium', 'low', 'info'];
 let latestReport = null;
@@ -68,8 +70,14 @@ form.addEventListener('submit', async (event) => {
   event.preventDefault();
 
   const url = urlInput.value.trim();
+  const active = activeCheckInput.checked;
+  const authorized = authorizationInput.checked;
   if (!url) {
     setStatus('Please enter a URL.', 'error');
+    return;
+  }
+  if (active && !authorized) {
+    setStatus('Confirm explicit authorization before running active checks.', 'error');
     return;
   }
 
@@ -83,7 +91,7 @@ form.addEventListener('submit', async (event) => {
     const response = await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, active, authorized }),
     });
 
     const payload = await response.json();
@@ -99,6 +107,9 @@ form.addEventListener('submit', async (event) => {
     document.getElementById('issue-count').textContent = totalFindings;
     document.getElementById('site-title').textContent = payload.title || 'Untitled page';
     document.getElementById('site-server').textContent = payload.server || 'Unknown server';
+    document.getElementById('active-status').textContent = payload.active_checks?.enabled
+      ? `Active checks: ${payload.active_checks.probes_sent} query probes`
+      : 'Passive checks only';
 
     renderFindings(payload.findings || []);
 
