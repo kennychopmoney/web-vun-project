@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebVun Scanner</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Security Toolkit</p>
+          <h1>WebVun Scanner</h1>
+        </div>
+      </header>
+
+      <main class="panel">
+        <p class="notice">
+          Run checks only against systems you own or are explicitly authorized to assess. These passive checks
+          identify potential weaknesses; verify findings manually before treating them as confirmed vulnerabilities.
+        </p>
+        <form id="scan-form" class="scan-form">
+          <label for="target-url">Target URL</label>
+          <div class="input-row">
+            <input id="target-url" type="url" placeholder="https://example.com" required />
+            <button type="submit">Scan</button>
+          </div>
+          <label class="check-option">
+            <input id="active-check" type="checkbox" />
+            Run active reflected-input checks (sends harmless markers in existing query parameters)
+          </label>
+          <label class="check-option authorization-option">
+            <input id="authorization-confirmed" type="checkbox" />
+            I confirm I have explicit authorization to actively test this host
+          </label>
+          <p class="active-note">
+            Active checks require the server operator to allowlist the exact hostname with
+            <code>WEBVUN_ACTIVE_ALLOWED_HOSTS</code>. Checks are limited to five query parameters, do not submit forms,
+            and do not follow redirects.
+          </p>
+        </form>
+
+        <div id="status" class="status hidden" aria-live="polite"></div>
+
+        <section id="summary" class="summary hidden">
+          <div class="stat-box">
+            <span class="label">Risk score</span>
+            <strong id="risk-score">0</strong>
+          </div>
+          <div class="stat-box">
+            <span class="label">Status</span>
+            <strong id="status-code">--</strong>
+          </div>
+          <div class="stat-box">
+            <span class="label">Issues found</span>
+            <strong id="issue-count">0</strong>
+          </div>
+        </section>
+
+        <section id="results" class="results hidden">
+          <div class="meta-row">
+            <span id="site-title">Site title</span>
+            <span id="site-server">Server</span>
+            <span id="active-status">Passive checks only</span>
+          </div>
+          <h2>Findings and remediation</h2>
+          <button id="download-report" class="download-button" type="button" disabled>Download JSON report</button>
+          <ul id="findings-list"></ul>
+        </section>
+      </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
