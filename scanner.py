@@ -11,6 +11,95 @@ SEVERITY_WEIGHT = {
     "critical": 30,
 }
 
+FINDING_GUIDANCE = {
+    "Missing HSTS header": (
+        "High",
+        "After confirming the site and all subdomains support HTTPS, send a Strict-Transport-Security header "
+        "with an appropriate max-age. Add includeSubDomains or preload only after validating their impact.",
+        "https://developer.mozilla.org/docs/Web/HTTP/Headers/Strict-Transport-Security",
+    ),
+    "Missing Content-Security-Policy header": (
+        "High",
+        "Define a Content-Security-Policy starting with a report-only policy, then restrict script, object, "
+        "base, and frame sources. Avoid unsafe-inline where possible and test before enforcement.",
+        "https://developer.mozilla.org/docs/Web/HTTP/Headers/Content-Security-Policy",
+    ),
+    "Missing frame protection": (
+        "High",
+        "Set Content-Security-Policy frame-ancestors to the required trusted origins, or use "
+        "X-Frame-Options for older browser compatibility.",
+        "https://developer.mozilla.org/docs/Web/HTTP/Headers/Content-Security-Policy/frame-ancestors",
+    ),
+    "Missing X-Content-Type-Options": (
+        "High",
+        "Send X-Content-Type-Options: nosniff and ensure each response has the correct Content-Type.",
+        "https://developer.mozilla.org/docs/Web/HTTP/Headers/X-Content-Type-Options",
+    ),
+    "Missing Referrer-Policy": (
+        "High",
+        "Set a Referrer-Policy such as strict-origin-when-cross-origin, or a stricter policy if the application requires it.",
+        "https://developer.mozilla.org/docs/Web/HTTP/Headers/Referrer-Policy",
+    ),
+    "Cookies are missing HttpOnly protection": (
+        "High",
+        "Set HttpOnly on session cookies that do not need to be read by browser JavaScript.",
+        "https://developer.mozilla.org/docs/Web/HTTP/Headers/Set-Cookie#httponly",
+    ),
+    "Cookies are missing Secure flags": (
+        "High",
+        "Set Secure on cookies served over HTTPS so browsers do not send them over plaintext HTTP.",
+        "https://developer.mozilla.org/docs/Web/HTTP/Headers/Set-Cookie#secure",
+    ),
+    "Cookies are missing SameSite protection": (
+        "High",
+        "Set SameSite=Lax or Strict where compatible. For cross-site use cases, use SameSite=None together with Secure "
+        "and implement appropriate CSRF defenses.",
+        "https://developer.mozilla.org/docs/Web/HTTP/Headers/Set-Cookie#samesitesamesite-value",
+    ),
+    "Inline script or JavaScript execution": (
+        "Low",
+        "Inline JavaScript is not by itself proof of a vulnerability. Prefer external scripts or CSP nonces/hashes, "
+        "and use context-aware output encoding wherever untrusted data is rendered.",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html",
+    ),
+    "Embedded active content": (
+        "Low",
+        "Review each embedded frame or plugin. Restrict frame sources with CSP and apply a restrictive sandbox "
+        "attribute to frames that do not need full privileges.",
+        "https://developer.mozilla.org/docs/Web/HTML/Element/iframe#sandbox",
+    ),
+    "Mixed-content resources": (
+        "High",
+        "Serve every script, stylesheet, image, and other resource over HTTPS. Update hard-coded HTTP URLs and "
+        "verify third-party resources support HTTPS.",
+        "https://developer.mozilla.org/docs/Web/Security/Mixed_content",
+    ),
+    "Password field detected": (
+        "Low",
+        "Confirm credentials are submitted only over HTTPS, use secure session cookies, and apply server-side "
+        "CSRF protections to state-changing authenticated actions.",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html",
+    ),
+    "Form may be missing CSRF protection": (
+        "Low",
+        "Verify the form is protected server-side with a per-session or per-request anti-CSRF token, and use "
+        "SameSite cookies as defense in depth. This static check can miss tokens added dynamically.",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html",
+    ),
+    "Potential open redirect or client-side redirect logic": (
+        "Low",
+        "Do not redirect directly to user-supplied URLs. Allowlist destinations or accept only validated relative "
+        "paths, and test the redirect endpoint with untrusted input.",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html",
+    ),
+    "Potential URL parameter redirect handling": (
+        "Low",
+        "Validate redirect destinations against an explicit allowlist or map short server-side identifiers to "
+        "approved destinations; reject arbitrary absolute URLs.",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html",
+    ),
+}
+
 
 def _ensure_valid_url(url: str) -> str:
     parsed = urlparse(url)
@@ -43,12 +132,19 @@ def _fetch_page(url: str) -> Dict:
 
 
 def _add_finding(findings: List[Dict], severity: str, title: str, description: str, evidence: str = "") -> None:
+    confidence, remediation, reference = FINDING_GUIDANCE.get(
+        title,
+        ("Low", "Review the evidence and verify the behavior in an authorized manual assessment.", ""),
+    )
     findings.append(
         {
             "severity": severity,
             "title": title,
             "description": description,
             "evidence": evidence,
+            "confidence": confidence,
+            "remediation": remediation,
+            "reference": reference,
         }
     )
 
@@ -76,7 +172,9 @@ def analyze_headers(headers: Dict[str, str], target_url: str) -> List[Dict]:
             "Content-Security-Policy is missing.",
         )
 
-    if "x-frame-options" not in lower_headers and "content-security-policy" not in lower_headers:
+    csp = lower_headers.get("content-security-policy", "")
+    has_frame_ancestors = bool(re.search(r"(?:^|;)\s*frame-ancestors(?:\s|;|$)", csp, flags=re.IGNORECASE))
+    if "x-frame-options" not in lower_headers and not has_frame_ancestors:
         _add_finding(
             findings,
             "medium",
@@ -105,30 +203,31 @@ def analyze_headers(headers: Dict[str, str], target_url: str) -> List[Dict]:
 
     set_cookie_values = [value for key, value in lower_headers.items() if key == "set-cookie"]
     for cookie_value in set_cookie_values:
-        cookie_text = cookie_value.lower()
-        if "httponly" not in cookie_text:
+        cookie_parts = [part.strip() for part in cookie_value.split(";")]
+        cookie_attributes = {part.split("=", 1)[0].strip().lower() for part in cookie_parts}
+        if "httponly" not in cookie_attributes:
             _add_finding(
                 findings,
                 "medium",
                 "Cookies are missing HttpOnly protection",
                 "Session cookies can be read by client-side scripts if HttpOnly is not enabled.",
-                cookie_value,
+                f"{cookie_parts[0].split('=', 1)[0]}=[redacted]; {'; '.join(cookie_parts[1:])}",
             )
-        if scheme == "https" and "secure" not in cookie_text:
+        if scheme == "https" and "secure" not in cookie_attributes:
             _add_finding(
                 findings,
                 "medium",
                 "Cookies are missing Secure flags",
                 "Session cookies should only be sent over encrypted connections.",
-                cookie_value,
+                f"{cookie_parts[0].split('=', 1)[0]}=[redacted]; {'; '.join(cookie_parts[1:])}",
             )
-        if "samesite" not in cookie_text:
+        if "samesite" not in cookie_attributes:
             _add_finding(
                 findings,
                 "low",
                 "Cookies are missing SameSite protection",
                 "Without SameSite controls, browsers may send cookies in cross-site requests.",
-                cookie_value,
+                f"{cookie_parts[0].split('=', 1)[0]}=[redacted]; {'; '.join(cookie_parts[1:])}",
             )
 
     return findings
@@ -141,18 +240,18 @@ def analyze_html(html: str, target_url: str = "") -> List[Dict]:
     if re.search(r"<script\b|on\w+=|javascript:\s*", lowered):
         _add_finding(
             findings,
-            "high",
+            "info",
             "Inline script or JavaScript execution",
-            "The page contains inline JavaScript or javascript: URLs, which creates script injection risk.",
+            "Inline JavaScript or javascript: URLs were observed. This is not proof of an exploitable injection vulnerability.",
             "Inline script or javascript: URL detected.",
         )
 
     if re.search(r"<iframe|<object|<embed", lowered):
         _add_finding(
             findings,
-            "medium",
+            "info",
             "Embedded active content",
-            "The page allows external plugins or frames, which may be abused for phishing or tracking.",
+            "An iframe, object, or embed element was observed. Review its source and restrictions; its presence alone is not a vulnerability.",
             "Active embedded element found in markup.",
         )
 
@@ -192,18 +291,18 @@ def analyze_html(html: str, target_url: str = "") -> List[Dict]:
     if re.search(r"(window\s*\.\s*location|document\s*\.\s*location|location\s*\.\s*href|window\.open\s*\()", lowered):
         _add_finding(
             findings,
-            "medium",
+            "low",
             "Potential open redirect or client-side redirect logic",
-            "Client-side redirect logic can be abused to send users to attacker-controlled destinations.",
+            "Client-side redirect logic was observed. This heuristic does not confirm that untrusted destinations are accepted.",
             "Redirect flow detected in JavaScript.",
         )
 
     if re.search(r"(?:redirect|returnurl|return_url|next|url)\s*[:=]\s*[\"']?https?://", lowered):
         _add_finding(
             findings,
-            "medium",
+            "low",
             "Potential URL parameter redirect handling",
-            "The page appears to rely on a URL parameter to determine where to redirect the user.",
+            "A redirect-like URL pattern was observed. Confirm whether the application accepts attacker-controlled destinations.",
             "A target URL or redirect parameter was detected in markup or script.",
         )
 

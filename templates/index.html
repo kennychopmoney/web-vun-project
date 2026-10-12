@@ -16,6 +16,10 @@
       </header>
 
       <main class="panel">
+        <p class="notice">
+          Run checks only against systems you own or are explicitly authorized to assess. These passive checks
+          identify potential weaknesses; verify findings manually before treating them as confirmed vulnerabilities.
+        </p>
         <form id="scan-form" class="scan-form">
           <label for="target-url">Target URL</label>
           <div class="input-row">
@@ -46,6 +50,8 @@
             <span id="site-title">Site title</span>
             <span id="site-server">Server</span>
           </div>
+          <h2>Findings and remediation</h2>
+          <button id="download-report" class="download-button" type="button" disabled>Download JSON report</button>
           <ul id="findings-list"></ul>
         </section>
       </main>

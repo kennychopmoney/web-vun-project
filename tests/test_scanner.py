@@ -19,11 +19,20 @@ class ScannerTests(unittest.TestCase):
         self.assertIn("Inline script or JavaScript execution", titles)
 
     def test_missing_cookie_flags_are_detected(self):
-        findings = analyze_headers({"Set-Cookie": "sessionid=abc; Path=/"}, "https://example.com")
+        findings = analyze_headers({"Set-Cookie": "sessionid=secret-value; Path=/"}, "https://example.com")
         titles = {item["title"] for item in findings}
         self.assertIn("Cookies are missing HttpOnly protection", titles)
         self.assertIn("Cookies are missing Secure flags", titles)
         self.assertIn("Cookies are missing SameSite protection", titles)
+        self.assertTrue(all("secret-value" not in item["evidence"] for item in findings))
+
+    def test_frame_ancestors_directive_protects_against_framing(self):
+        findings = analyze_headers(
+            {"Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'"},
+            "https://example.com",
+        )
+        titles = {item["title"] for item in findings}
+        self.assertNotIn("Missing frame protection", titles)
 
     def test_open_redirect_logic_is_detected(self):
         findings = analyze_html(
@@ -32,6 +41,8 @@ class ScannerTests(unittest.TestCase):
         )
         titles = {item["title"] for item in findings}
         self.assertIn("Potential open redirect or client-side redirect logic", titles)
+        self.assertTrue(all(item["remediation"] for item in findings))
+        self.assertTrue(all(item["confidence"] for item in findings))
 
 
 if __name__ == "__main__":

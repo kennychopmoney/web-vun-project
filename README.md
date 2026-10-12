@@ -11,8 +11,14 @@ A lightweight web vulnerability scanner built with Flask. It checks a target URL
 - Checks cookie protection flags such as HttpOnly, Secure, and SameSite
 - Identifies likely CSRF gaps on sensitive forms
 - Flags client-side redirect logic and redirect-parameter patterns
+- Gives each finding remediation guidance, a detection-confidence indicator, and a technical reference
+- Exports scan results as a JSON report
+- Redacts cookie values from displayed evidence
+- Uses non-intrusive checks; findings are heuristics and should be manually verified
 - Shows a simple risk score and summary
 - Includes a lightweight browser UI
+
+Only scan systems you own or have explicit permission to assess. This tool performs passive checks against the supplied page; it does not exploit vulnerabilities or confirm that a suspected issue is exploitable.
 
 ## Run it locally
 
