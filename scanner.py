@@ -1,9 +1,13 @@
 import ipaddress
 import re
 import secrets
+import shutil
 import socket
 import ssl
+import subprocess
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from json import JSONDecoder, JSONDecodeError
 from typing import Dict, List
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
@@ -17,6 +21,9 @@ SEVERITY_WEIGHT = {
     "critical": 30,
 }
 RECON_PORTS = (80, 443, 8080, 8443)
+NMAP_IMAGE = "webvun/nmap:1"
+ZAP_IMAGE = "ghcr.io/zaproxy/zaproxy:stable"
+NMAP_PORT_LIMIT = 20
 
 FINDING_GUIDANCE = {
     "Missing HSTS header": (
@@ -129,15 +136,23 @@ class _NoRedirectHandler(HTTPRedirectHandler):
         return None
 
 
-def _fetch_page(url: str, follow_redirects: bool = True, max_bytes: int | None = None) -> Dict:
+def _fetch_page(
+    url: str,
+    follow_redirects: bool = True,
+    max_bytes: int | None = None,
+    return_redirect_response: bool = False,
+) -> Dict:
     request = Request(url, headers={"User-Agent": "WebVunScanner/1.0"})
     opener = build_opener() if follow_redirects else build_opener(_NoRedirectHandler)
     try:
         response_context = opener.open(request, timeout=10)
     except HTTPError as exc:
-        if not follow_redirects and 300 <= exc.code < 400:
+        if not follow_redirects and 300 <= exc.code < 400 and return_redirect_response:
+            response_context = exc
+        elif not follow_redirects and 300 <= exc.code < 400:
             raise ValueError("Active scans do not follow redirects. Scan the authorized destination directly.") from exc
-        raise
+        else:
+            raise
 
     with response_context as response:
         content_bytes = response.read(max_bytes + 1) if max_bytes is not None else response.read()
@@ -147,14 +162,31 @@ def _fetch_page(url: str, follow_redirects: bool = True, max_bytes: int | None =
         headers = {str(key): str(value) for key, value in response.headers.items()}
         return {
             "url": response.geturl(),
-            "status_code": getattr(response, "status", 200),
+            "status_code": getattr(response, "status", getattr(response, "code", 200)),
             "content_type": headers.get("Content-Type", "unknown"),
             "headers": headers,
             "html": content,
         }
 
 
-def _validate_active_target(url: str, allowed_hosts: set[str], require_query: bool = True) -> str:
+def _resolve_public_addresses(hostname: str, port: int | None) -> List[str]:
+    try:
+        addresses = sorted(
+            {entry[4][0] for entry in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)}
+        )
+    except OSError as exc:
+        raise ValueError(f"Could not resolve the allowlisted host: {exc}") from exc
+
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise ValueError("Active checks require an allowlisted hostname that resolves only to public IP addresses.")
+    return addresses
+
+
+def _validate_active_scope(
+    url: str,
+    allowed_hosts: set[str],
+    require_query: bool = True,
+) -> tuple[str, str, List[str]]:
     normalized_url = _ensure_valid_url(url)
     parsed = urlparse(normalized_url)
     hostname = (parsed.hostname or "").lower().rstrip(".")
@@ -169,27 +201,11 @@ def _validate_active_target(url: str, allowed_hosts: set[str], require_query: bo
     if require_query and not parsed.query:
         raise ValueError("Add one or more query parameters to the URL to run reflected-input checks.")
 
-    try:
-        addresses = {entry[4][0] for entry in socket.getaddrinfo(hostname, parsed.port, type=socket.SOCK_STREAM)}
-    except OSError as exc:
-        raise ValueError(f"Could not resolve the allowlisted host: {exc}") from exc
-
-    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
-        raise ValueError("Active checks require an allowlisted hostname that resolves only to public IP addresses.")
-    return normalized_url
+    return normalized_url, hostname, _resolve_public_addresses(hostname, parsed.port)
 
 
-def _resolve_public_addresses(hostname: str, port: int | None) -> List[str]:
-    try:
-        addresses = sorted(
-            {entry[4][0] for entry in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)}
-        )
-    except OSError as exc:
-        raise ValueError(f"Could not resolve the allowlisted host: {exc}") from exc
-
-    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
-        raise ValueError("Active checks require an allowlisted hostname that resolves only to public IP addresses.")
-    return addresses
+def _validate_active_target(url: str, allowed_hosts: set[str], require_query: bool = True) -> str:
+    return _validate_active_scope(url, allowed_hosts, require_query)[0]
 
 
 def _read_tls_certificate(hostname: str, address: str, port: int) -> Dict:
@@ -217,10 +233,16 @@ def _read_tls_certificate(hostname: str, address: str, port: int) -> Dict:
 
 
 def run_reconnaissance(url: str, allowed_hosts: set[str]) -> Dict:
-    normalized_url = _validate_active_target(url, allowed_hosts, require_query=False)
+    normalized_url, hostname, addresses = _validate_active_scope(
+        url,
+        allowed_hosts,
+        require_query=False,
+    )
+    return _run_reconnaissance_validated(normalized_url, hostname, addresses)
+
+
+def _run_reconnaissance_validated(normalized_url: str, hostname: str, addresses: List[str]) -> Dict:
     parsed = urlsplit(normalized_url)
-    hostname = (parsed.hostname or "").lower().rstrip(".")
-    addresses = _resolve_public_addresses(hostname, parsed.port)
 
     port_results = []
     for address in addresses[:4]:
@@ -258,6 +280,235 @@ def run_reconnaissance(url: str, allowed_hosts: set[str]) -> Dict:
             "maximum_addresses_checked": 4,
             "connect_timeout_seconds": 0.5,
         },
+    }
+
+
+def _run_scanner_container(
+    image: str,
+    container_args: List[str],
+    timeout_seconds: int,
+    memory: str,
+    cpu_limit: str,
+    extra_args: List[str] | None = None,
+    accepted_exit_codes: tuple[int, ...] = (0,),
+) -> subprocess.CompletedProcess:
+    docker_path = shutil.which("docker")
+    if docker_path is None:
+        raise RuntimeError("Docker is required for Nmap/ZAP scans but the Docker CLI was not found.")
+
+    try:
+        image_status = subprocess.run(
+            [docker_path, "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Timed out while checking for the local scanner image.") from exc
+    if image_status.returncode != 0:
+        raise RuntimeError(
+            f"Required Docker image '{image}' is not available locally. Follow the README setup instructions first."
+        )
+
+    container_name = f"webvun-scan-{secrets.token_hex(8)}"
+    command = [
+        docker_path,
+        "run",
+        "--rm",
+        f"--name={container_name}",
+        "--pull=never",
+        "--network=bridge",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--pids-limit=128",
+        f"--memory={memory}",
+        f"--cpus={cpu_limit}",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,size=128m",
+    ]
+    command.extend(extra_args or [])
+    command.extend([image, *container_args])
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        cleanup = subprocess.run(
+            [docker_path, "container", "rm", "--force", container_name],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if cleanup.returncode != 0 and "no such container" not in cleanup.stderr.lower():
+            detail = cleanup.stderr.strip()[-500:] or "No diagnostic output was produced."
+            raise RuntimeError(f"Could not clean up timed-out scanner container: {detail}") from exc
+        raise RuntimeError(f"Docker scanner exceeded its {timeout_seconds}-second time limit.") from exc
+
+    if result.returncode not in accepted_exit_codes:
+        detail = result.stderr.strip()[-1000:] or "No diagnostic output was produced."
+        raise RuntimeError(f"Docker scanner failed with exit code {result.returncode}: {detail}")
+    return result
+
+
+def run_nmap_scan(url: str, allowed_hosts: set[str]) -> Dict:
+    _, hostname, addresses = _validate_active_scope(
+        url,
+        allowed_hosts,
+        require_query=False,
+    )
+    target_address = addresses[0]
+    nmap_arguments = [
+        "-sT",
+        "-Pn",
+        "-n",
+        "--unprivileged",
+        "--top-ports",
+        str(NMAP_PORT_LIMIT),
+        "--open",
+        "--reason",
+        "--max-retries",
+        "1",
+        "--host-timeout",
+        "30s",
+        "--scan-delay",
+        "100ms",
+        "-oX",
+        "-",
+    ]
+    if ipaddress.ip_address(target_address).version == 6:
+        nmap_arguments.insert(0, "-6")
+    result = _run_scanner_container(
+        NMAP_IMAGE,
+        [*nmap_arguments, target_address],
+        timeout_seconds=45,
+        memory="256m",
+        cpu_limit="0.5",
+    )
+    try:
+        root = ET.fromstring(result.stdout)
+    except ET.ParseError as exc:
+        raise RuntimeError("Nmap returned invalid XML output.") from exc
+
+    open_ports = []
+    for port_node in root.findall("./host/ports/port"):
+        state_node = port_node.find("state")
+        if state_node is None or state_node.get("state") != "open":
+            continue
+        service_node = port_node.find("service")
+        open_ports.append(
+            {
+                "port": int(port_node.get("portid", "0")),
+                "protocol": port_node.get("protocol", "tcp"),
+                "service": service_node.get("name", "unknown") if service_node is not None else "unknown",
+                "reason": state_node.get("reason", "unknown"),
+            }
+        )
+
+    finished = root.find("./runstats/finished")
+    return {
+        "hostname": hostname,
+        "target_address": target_address,
+        "method": "TCP connect scan",
+        "ports_scanned": NMAP_PORT_LIMIT,
+        "open_ports": open_ports,
+        "limitations": "No service-version detection, OS detection, UDP scan, scripts, or exploit checks were run.",
+        "exit_status": finished.get("exit", "unknown") if finished is not None else "unknown",
+    }
+
+
+def _extract_zap_report(output: str) -> Dict:
+    decoder = JSONDecoder()
+    for index, character in enumerate(output):
+        if character != "{":
+            continue
+        try:
+            report, _ = decoder.raw_decode(output[index:])
+        except JSONDecodeError:
+            continue
+        if isinstance(report, dict) and isinstance(report.get("site"), list):
+            return report
+    raise RuntimeError("ZAP did not produce a parseable JSON baseline report.")
+
+
+def run_zap_baseline(url: str, allowed_hosts: set[str]) -> Dict:
+    normalized_url, hostname, addresses = _validate_active_scope(
+        url,
+        allowed_hosts,
+        require_query=False,
+    )
+    parsed = urlsplit(normalized_url)
+    target_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
+    output = _run_scanner_container(
+        ZAP_IMAGE,
+        [
+            "zap-baseline.py",
+            "-t",
+            target_url,
+            "-m",
+            "1",
+            "-T",
+            "3",
+            "-I",
+            "-J",
+            "/dev/stdout",
+        ],
+        timeout_seconds=240,
+        memory="1g",
+        cpu_limit="1",
+        extra_args=[
+            "--add-host",
+            f"{hostname}:{addresses[0]}",
+            "-e",
+            "HOME=/tmp",
+            "-e",
+            "ZAP_HOME=/tmp/zap",
+        ],
+        accepted_exit_codes=(0, 1),
+    )
+    report = _extract_zap_report(output.stdout)
+
+    confidence_labels = {"0": "False positive", "1": "Low", "2": "Medium", "3": "High"}
+    risk_labels = {"0": "info", "1": "low", "2": "medium", "3": "high", "4": "critical"}
+    alerts = []
+    for site in report["site"]:
+        for alert in site.get("alerts", []):
+            risk = str(alert.get("riskcode", "0"))
+            alerts.append(
+                {
+                    "severity": risk_labels.get(risk, "info"),
+                    "title": str(alert.get("alert", "ZAP alert"))[:300],
+                    "description": str(alert.get("desc", ""))[:3000],
+                    "evidence": f"Instances: {len(alert.get('instances', []))}",
+                    "confidence": confidence_labels.get(str(alert.get("confidence", "0")), "Unknown"),
+                    "remediation": str(alert.get("solution", "Review the ZAP passive alert and verify applicability."))[:3000],
+                    "reference": str(alert.get("reference", ""))[:1000],
+                    "source": "OWASP ZAP baseline",
+                }
+            )
+            if len(alerts) >= 100:
+                break
+        if len(alerts) >= 100:
+            break
+
+    summary: Dict[str, int] = {}
+    for alert in alerts:
+        summary[alert["severity"]] = summary.get(alert["severity"], 0) + 1
+    return {
+        "hostname": hostname,
+        "profile": "OWASP ZAP baseline (spider + passive rules; no active attack scan)",
+        "alerts": alerts,
+        "summary": summary,
+        "duration_limit_minutes": 1,
+        "note": "The baseline spider can issue GET requests. Alerts are heuristic and need manual verification.",
     }
 
 
@@ -499,18 +750,26 @@ def scan_url(
     active: bool = False,
     allowed_hosts: set[str] | None = None,
     reconnaissance: bool = False,
+    nmap: bool = False,
+    zap_baseline: bool = False,
 ) -> Dict:
     normalized_url = _ensure_valid_url(url)
-    if active or reconnaissance:
+    if active and (nmap or zap_baseline or reconnaissance):
+        raise ValueError("Reflected-input checks must be run separately from reconnaissance or Docker scans.")
+    active_modes = active or reconnaissance or nmap or zap_baseline
+    if active_modes:
         if allowed_hosts is None:
             raise ValueError("Active checks are not configured on this server.")
         normalized_url = _validate_active_target(normalized_url, allowed_hosts, require_query=active)
-    restricted_active_scan = active or reconnaissance
+    restricted_active_scan = active or reconnaissance or nmap or zap_baseline
     page = _fetch_page(
         normalized_url,
         follow_redirects=not restricted_active_scan,
         max_bytes=1_000_000 if restricted_active_scan else None,
+        return_redirect_response=restricted_active_scan,
     )
+    if zap_baseline and 300 <= page["status_code"] < 400:
+        raise ValueError("ZAP baseline will not follow redirects. Enter the final authorized URL directly.")
     findings = analyze_headers(page["headers"], normalized_url)
     findings.extend(analyze_html(page["html"], normalized_url))
 
@@ -520,6 +779,10 @@ def scan_url(
         findings.extend(active_findings)
         active_checks["probes_sent"] = len(parse_qsl(urlparse(normalized_url).query, keep_blank_values=True))
     recon_results = run_reconnaissance(normalized_url, allowed_hosts or set()) if reconnaissance else None
+    nmap_results = run_nmap_scan(normalized_url, allowed_hosts or set()) if nmap else None
+    zap_results = run_zap_baseline(normalized_url, allowed_hosts or set()) if zap_baseline else None
+    if zap_results:
+        findings.extend(zap_results["alerts"])
 
     summary = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
     for item in findings:
@@ -539,5 +802,7 @@ def scan_url(
         "findings": findings,
         "active_checks": active_checks,
         "reconnaissance": recon_results,
+        "nmap_scan": nmap_results,
+        "zap_baseline": zap_results,
     }
     return result

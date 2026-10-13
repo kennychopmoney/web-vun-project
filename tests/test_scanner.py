@@ -1,15 +1,20 @@
+import subprocess
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 from app import app
 from scanner import (
+    NMAP_IMAGE,
     RECON_PORTS,
+    ZAP_IMAGE,
     _NoRedirectHandler,
     analyze_headers,
     analyze_html,
     check_reflected_input,
+    run_nmap_scan,
     run_reconnaissance,
+    run_zap_baseline,
 )
 
 
@@ -153,6 +158,117 @@ class ScannerTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 403)
         mock_scan.assert_not_called()
+
+    @patch("scanner._run_scanner_container")
+    @patch(
+        "scanner.socket.getaddrinfo",
+        return_value=[(None, None, None, None, ("93.184.216.34", 443))],
+    )
+    def test_nmap_uses_validated_ip_and_parses_open_ports(self, _mock_dns, mock_docker):
+        mock_docker.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                '<nmaprun><host><ports><port protocol="tcp" portid="443">'
+                '<state state="open" reason="syn-ack"/><service name="https"/>'
+                '</port></ports></host><runstats><finished exit="success"/></runstats></nmaprun>'
+            ),
+            stderr="",
+        )
+
+        result = run_nmap_scan("https://test.example.com/", {"test.example.com"})
+
+        self.assertEqual(result["target_address"], "93.184.216.34")
+        self.assertEqual(
+            result["open_ports"],
+            [{"port": 443, "protocol": "tcp", "service": "https", "reason": "syn-ack"}],
+        )
+        self.assertEqual(mock_docker.call_args.args[0], NMAP_IMAGE)
+        self.assertIn("20", mock_docker.call_args.args[1])
+        self.assertIn("--unprivileged", mock_docker.call_args.args[1])
+
+    @patch("scanner._run_scanner_container")
+    @patch(
+        "scanner.socket.getaddrinfo",
+        return_value=[(None, None, None, None, ("93.184.216.34", 443))],
+    )
+    def test_zap_parses_passive_alert_and_excludes_query_values(self, _mock_dns, mock_docker):
+        mock_docker.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "ZAP baseline starting\n"
+                '{"site":[{"alerts":[{"riskcode":"2","confidence":"3",'
+                '"alert":"Header review","desc":"Description","solution":"Remediation",'
+                '"reference":"https://example.org/docs","instances":[{}]}]}]}'
+            ),
+            stderr="",
+        )
+
+        result = run_zap_baseline(
+            "https://test.example.com/path?token=secret#fragment",
+            {"test.example.com"},
+        )
+
+        self.assertEqual(result["alerts"][0]["severity"], "medium")
+        self.assertEqual(result["alerts"][0]["confidence"], "High")
+        self.assertEqual(result["summary"], {"medium": 1})
+        self.assertEqual(mock_docker.call_args.args[0], ZAP_IMAGE)
+        self.assertEqual(mock_docker.call_args.args[1][2], "https://test.example.com/path")
+        self.assertNotIn("secret", str(result))
+
+    @patch("scanner.shutil.which", return_value=None)
+    def test_docker_scan_fails_clearly_when_cli_is_missing(self, _mock_which):
+        from scanner import _run_scanner_container
+
+        with self.assertRaisesRegex(RuntimeError, "Docker CLI was not found"):
+            _run_scanner_container("webvun/nmap:1", [], 10, "256m", "0.5")
+
+    @patch("scanner.subprocess.run")
+    @patch("scanner.shutil.which", return_value="C:\\Program Files\\Docker\\docker.exe")
+    def test_docker_runner_uses_restricted_container_options(self, _mock_which, mock_run):
+        mock_run.side_effect = [
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr=""),
+        ]
+        from scanner import _run_scanner_container
+
+        result = _run_scanner_container("webvun/nmap:1", ["-sT", "93.184.216.34"], 45, "256m", "0.5")
+
+        command = mock_run.call_args_list[1].args[0]
+        self.assertEqual(result.stdout, "ok")
+        self.assertIn("--pull=never", command)
+        self.assertIn("--network=bridge", command)
+        self.assertIn("--read-only", command)
+        self.assertIn("--cap-drop=ALL", command)
+        self.assertNotIn("--privileged", command)
+        self.assertFalse(any(argument in {"-v", "--volume"} for argument in command))
+
+    @patch("scanner.scan_url")
+    def test_api_requires_authorization_for_docker_scan(self, mock_scan):
+        with app.test_client() as client:
+            response = client.post(
+                "/api/scan",
+                json={"url": "https://test.example.com/", "nmap": True},
+            )
+        self.assertEqual(response.status_code, 403)
+        mock_scan.assert_not_called()
+
+    def test_api_rejects_combined_reflection_and_docker_scan_modes(self):
+        with patch("app.ACTIVE_ALLOWED_HOSTS", {"test.example.com"}):
+            with patch("scanner.socket.getaddrinfo", return_value=[(None, None, None, None, ("93.184.216.34", 443))]):
+                with app.test_client() as client:
+                    response = client.post(
+                        "/api/scan",
+                        json={
+                            "url": "https://test.example.com/search?q=sample",
+                            "active": True,
+                            "nmap": True,
+                            "authorized": True,
+                        },
+                    )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("separately", response.get_json()["error"])
 
 
 if __name__ == "__main__":

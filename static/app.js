@@ -7,8 +7,11 @@ const findingsList = document.getElementById('findings-list');
 const downloadButton = document.getElementById('download-report');
 const activeCheckInput = document.getElementById('active-check');
 const reconCheckInput = document.getElementById('recon-check');
+const nmapCheckInput = document.getElementById('nmap-check');
+const zapCheckInput = document.getElementById('zap-check');
 const authorizationInput = document.getElementById('authorization-confirmed');
 const reconResults = document.getElementById('recon-results');
+const dockerResults = document.getElementById('docker-results');
 
 const severityOrder = ['critical', 'high', 'medium', 'low', 'info'];
 let latestReport = null;
@@ -55,7 +58,7 @@ function renderFindings(findings) {
     remediation.append(remediationTitle, remediationText);
 
     li.append(header, description, confidence, evidence, remediation);
-    if (item.reference) {
+    if (item.reference && /^https?:\/\//i.test(item.reference)) {
       const reference = document.createElement('a');
       reference.href = item.reference;
       reference.target = '_blank';
@@ -95,19 +98,57 @@ function renderRecon(data) {
   reconResults.append(heading, host, addresses, ports, tls, note);
 }
 
+function renderDockerResults(nmap, zap) {
+  dockerResults.replaceChildren();
+  dockerResults.classList.toggle('hidden', !nmap && !zap);
+  if (!nmap && !zap) {
+    return;
+  }
+
+  const heading = document.createElement('h3');
+  heading.textContent = 'Docker scans';
+  dockerResults.appendChild(heading);
+
+  if (nmap) {
+    const nmapSummary = document.createElement('p');
+    const openPorts = nmap.open_ports.map((port) => `${port.port}/${port.protocol} (${port.service})`);
+    nmapSummary.textContent = `Nmap TCP connect scan on ${nmap.target_address}: ${
+      openPorts.length ? openPorts.join(', ') : 'no open ports found in the fixed top-20 set'
+    }.`;
+    const nmapLimits = document.createElement('small');
+    nmapLimits.textContent = nmap.limitations;
+    dockerResults.append(nmapSummary, nmapLimits);
+  }
+
+  if (zap) {
+    const zapSummary = document.createElement('p');
+    const count = zap.alerts.length;
+    zapSummary.textContent = `OWASP ZAP baseline reported ${count} passive alert${count === 1 ? '' : 's'}. See findings below.`;
+    const zapNote = document.createElement('small');
+    zapNote.textContent = zap.note;
+    dockerResults.append(zapSummary, zapNote);
+  }
+}
+
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
 
   const url = urlInput.value.trim();
   const active = activeCheckInput.checked;
   const reconnaissance = reconCheckInput.checked;
+  const nmap = nmapCheckInput.checked;
+  const zapBaseline = zapCheckInput.checked;
   const authorized = authorizationInput.checked;
   if (!url) {
     setStatus('Please enter a URL.', 'error');
     return;
   }
-  if ((active || reconnaissance) && !authorized) {
+  if ((active || reconnaissance || nmap || zapBaseline) && !authorized) {
     setStatus('Confirm explicit authorization before running active checks.', 'error');
+    return;
+  }
+  if (active && (reconnaissance || nmap || zapBaseline)) {
+    setStatus('Run reflected-input checks separately from reconnaissance and Docker scans.', 'error');
     return;
   }
 
@@ -121,7 +162,7 @@ form.addEventListener('submit', async (event) => {
     const response = await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, active, reconnaissance, authorized }),
+      body: JSON.stringify({ url, active, reconnaissance, nmap, zap_baseline: zapBaseline, authorized }),
     });
 
     const payload = await response.json();
@@ -144,12 +185,19 @@ form.addEventListener('submit', async (event) => {
     if (payload.reconnaissance) {
       activeModes.push('reconnaissance');
     }
+    if (payload.nmap_scan) {
+      activeModes.push('Nmap Docker');
+    }
+    if (payload.zap_baseline) {
+      activeModes.push('ZAP baseline');
+    }
     document.getElementById('active-status').textContent = activeModes.length
       ? `Active checks: ${activeModes.join(' + ')}`
       : 'Passive checks only';
 
     renderFindings(payload.findings || []);
     renderRecon(payload.reconnaissance);
+    renderDockerResults(payload.nmap_scan, payload.zap_baseline);
 
     summaryBox.classList.remove('hidden');
     resultsBox.classList.remove('hidden');

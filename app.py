@@ -28,11 +28,13 @@ def api_scan():
     target = (target_value or "").strip()
     active = payload.get("active") is True
     reconnaissance = payload.get("reconnaissance") is True
+    nmap = payload.get("nmap") is True
+    zap_baseline = payload.get("zap_baseline") is True
     authorized = payload.get("authorized") is True
 
     if not target:
         return jsonify({"error": "A URL is required."}), 400
-    if (active or reconnaissance) and not authorized:
+    if (active or reconnaissance or nmap or zap_baseline) and not authorized:
         return jsonify({"error": "Confirm explicit authorization before enabling active checks."}), 403
 
     try:
@@ -41,6 +43,8 @@ def api_scan():
             active=active,
             allowed_hosts=ACTIVE_ALLOWED_HOSTS,
             reconnaissance=reconnaissance,
+            nmap=nmap,
+            zap_baseline=zap_baseline,
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
